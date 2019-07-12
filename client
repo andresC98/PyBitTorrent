@@ -1,0 +1,526 @@
+#!/usr/bin/env python3
+import socket,requests, urllib, hashlib
+import sys, math, random , time, threading
+from bcoding import bencode, bdecode
+from random import shuffle
+import traceback #debug purposes
+
+threading.TIMEOUT_MAX = 9
+
+class Peer(object):
+    """Peer connecting"""
+    def __init__(self, peer_ip, peer_port):
+        self.ip = peer_ip
+        self.port = peer_port
+        self.am_choked = True #initial state, peer is choking us
+        self.am_interested = False
+        self.chocked = False
+        self.interested = False
+        self.his_bitfield = []
+        self.countkeepalive = 0
+        self.piece_req = 0
+
+def send_handshake(sock,peer_id,info_hash):
+    '''
+    Sends handshake msg to a peer. Handshake format:
+    <p.name len (1B)><p.name><reserved (8B)><info_hash><peer_id>
+    Returns 1 if successful handshake with peer, or -1 if failed.
+    '''
+    p_name = "BitTorrent protocol".encode('utf-8')
+    p_name_len = bytes([len(p_name)])
+    reserved = bytes(8)
+    handshake = p_name_len+p_name+reserved+info_hash+peer_id
+    sock.send(handshake)
+    try:
+        rcv = sock.recv(68)
+        while(len(rcv) < 68):
+            rcv += sock.recv(68-len(rcv))
+        recv_handshake = rcv
+    except: #failed handshake
+        return -1
+
+    if(len(recv_handshake) == 68): #rcv correct handshake
+        return 1
+    else:
+        return -1
+    return 1 #exit Successfuly
+
+def craft_bitfield_msg(sock,bitfield):
+    '''
+    Crafts empty bitfield. Not using right now.
+    '''
+    msg_type = b'\x05'
+    bitf = b''
+    cumm = 0
+    while(cumm < len(bitfield)):
+        cumm +=8
+        bitf += b'\x00'
+    msg_len = (1+len(bitf)).to_bytes(4,"big")
+    sock.send(msg_len+msg_type+bitf)
+    return 0
+
+def request_piece(sock, peer, index, b_offset,handling_last):
+    '''
+    Request msg format: <len=0013><id=6><i><begin><len>
+    If we are chocked, sends Interested message and waits for unchoking.
+    Once unchocked, sends a batch of requests (5 at a time) to the peer,
+    adjusting the offset (set to 4000 bytes subpieces).
+
+    Returns peer object with our updated state (Unchoked)
+    '''
+
+    msg_type = b'\x06'
+    piece_index = (index).to_bytes(4,"big")
+    begin_offset = (b_offset).to_bytes(4,"big")
+    p_len = b_len.to_bytes(4,"big") #block size
+    if(peer.am_choked):#we are choked, send interested
+        sock.send(b'\x00\x00\x00\x01\x02')
+        peer.am_interested = True
+        # craft_bitfield_msg(sock,peer.his_bitfield) #sends empty bitfield
+        while(peer.am_choked):
+            peer, _, _, _, _ = handle_peer(sock, peer,[],0)
+            if(not peer.am_choked): #peer unchoked us
+                break
+
+    total = 0
+    if((index+1) < num_pieces):
+        while((b_offset + b_len) < piece_len):
+            if(total%5 == 0):
+                time.sleep(0.05)
+            if(total==0):
+                b_offset = 0
+            else:
+                b_offset += b_len
+            begin_offset = (b_offset).to_bytes(4,"big")
+            msg = msg_type + piece_index + begin_offset+p_len
+            msg_len = len(msg).to_bytes(4,"big")
+            piece_req = msg_len + msg
+            sock.send(piece_req)
+            total += 1
+    else: #last piece
+        req_data = 0 #requested bytes
+        first_block = True
+        while(req_data < last_p_len): #not last block
+            if(req_data + b_len > last_p_len):#last block
+                p_len = (last_p_len - req_data).to_bytes(4,"big")
+                req_data += last_p_len - req_data
+                b_offset += b_len
+            else:
+                first_block = False
+                if(total==0):
+                    b_offset = 0
+                elif(total%5==0):
+                    time.sleep(0.05)
+                else:
+                    b_offset += b_len
+                total += 1
+                req_data += b_len
+            if(req_data + b_len > last_p_len and first_block):
+                b_offset = 0 #last piece has only a block
+            begin_offset = (b_offset).to_bytes(4,"big")
+            msg = msg_type + piece_index + begin_offset+p_len
+            msg_len = len(msg).to_bytes(4,"big")
+            piece_req = msg_len + msg
+            sock.send(piece_req)
+
+    return peer
+
+def handle_have(sock, peer):
+    '''
+    Obtains a HAVE message and adds the piece to peer's bitfield
+    Returns updated peer object.
+    '''
+    rcv = sock.recv(4)
+    while(len(rcv) < 4):
+        rcv += sock.recv(4-len(rcv))
+    piece_id = int.from_bytes(rcv, "big")
+    peer.his_bitfield[piece_id] = 1
+    #print("HAVE:[{}] from {}:{}".format(piece_id, peer.ip,peer.port))
+    return peer
+
+def handle_bitfield(sock, peer, msg_len):
+    '''
+    Obtains bitfield bytes and returns a boolean
+    array of 0s and 1s of length #pieces
+    E.g: [1,1,1,1,1,1,0,1,1,0]
+    '''
+    bitfield_len = msg_len -1
+    bitfield = sock.recv(bitfield_len)
+    while(len(bitfield)<bitfield_len):
+        bitfield += sock.recv(bitfield_len-len(bitfield))
+    bit_array =[]
+    for bit in bin(int.from_bytes(bitfield, byteorder="big")):
+        bit_array.append(bit)
+    #removing 0b part:
+    try:
+        bit_array.pop(0)
+        bit_array.pop(0)
+    except:#bitfield was empty ("dummy bitfield")
+        return bit_array
+    for index, elem in enumerate(bit_array):
+        bit_array[index]= int(bit_array[index])
+    while(num_pieces - len(bit_array) != 0):
+        try:
+            bit_array.pop()
+        except:
+            return bit_array
+
+    return bit_array
+
+def handle_subpiece(sock, peer, subpiece_len):
+    '''
+    Receives subpiece from peer.
+    Returns corresponding piece id, subpiece data, offset and its length.
+    '''
+    rcv = sock.recv(4)
+    while(len(rcv) < 4):
+        rcv += sock.recv(4-len(rcv))
+    piece_id = int.from_bytes(rcv,"big")
+    rcv = 0
+    rcv = sock.recv(4)
+    while(len(rcv) < 4):
+        rcv += sock.recv(4-len(rcv))
+    b_offset = int.from_bytes(rcv,"big")
+    rcv = 0
+    rcv = sock.recv(subpiece_len)
+    while(len(rcv) < subpiece_len):
+        rcv += sock.recv(subpiece_len - len(rcv))
+    subpiece_data = rcv
+    return subpiece_data, b_offset, subpiece_len, piece_id
+
+
+def handle_request(sock, peer):
+    '''
+    Not implemented yet, only ignores what received
+    '''
+    requested = sock.recv(12)
+    while(len(requested) < 12):
+        requested += sock.recv(12-len(requested))
+
+    piece_i = int.from_bytes(requested[:4],"big")
+    piece_begin = int.from_bytes(requested[4:8],"big")
+    piece_blocklen = int.from_bytes(requested[8:12],"big")
+
+    #print("{}:{} Requests [{}], Begin:{}, Length:{}.".format(peer.ip,peer.port,piece_i,piece_begin,piece_blocklen))
+    return 0
+
+def handle_peer(sock, peer,subpieces,handling_last):
+    '''
+    Handles messages received from the peer. Invokes corresponding handlers.
+    Also alters the Peer object attributes based on received states.
+    Returns updated peer state and relevant obtained data (e.g pieces)
+    '''
+    #Safe msg reception.
+    try:
+        rcv = sock.recv(4)
+    except:
+        lock.acquire()
+        pieces_requesting[peer.piece_req] = 0
+        lock.release()
+        exit()
+    if not rcv:
+        exit()
+    while(len(rcv) <4):
+        rcv += sock.recv(4-len(rcv))
+
+    msg_len = int.from_bytes(rcv, "big")
+
+    if(msg_len != 0): #not a keepalive
+        rcv = sock.recv(1)
+        if not rcv:
+            exit()
+        while(len(rcv) <1):
+            rcv += sock.recv(1)
+        msg_type = int.from_bytes(rcv, "big")
+    else:
+        msg_type = -1 #keepalive
+
+    block_len = -1
+    if(msg_len ==0 and msg_type ==-1):
+        peer.countkeepalive += 1
+        if(peer.countkeepalive == 20): #not needed
+            exit()
+        #sock.send(b'\x00\x00\x00\x00') #send keepalive back
+    elif(msg_type == 0): #peer chokes us
+        peer.am_choked = True
+    elif(msg_type == 1): #peer unchokes us
+        peer.am_choked = False
+    elif(msg_type == 2): #peer is interested
+        peer.interested = True
+    elif(msg_type == 3): #peer is uninterested
+        peer.interested = False
+    elif(msg_type == 4): #Have.
+        peer = handle_have(sock,peer)
+    elif(msg_type == 5):#received bitfield from peer
+        peer.his_bitfield = handle_bitfield(sock, peer, msg_len)
+    elif(msg_type == 6): #Request TODO
+        ok = handle_request(sock, peer)
+    elif(msg_type == 7): #Received Piece block (subpiece)
+        subpiece_len = msg_len - 9
+        subpiece_data, offset, block_len, subp_id = handle_subpiece(sock, peer,subpiece_len)
+        subpieces.append((subpiece_data, offset,len(subpiece_data),subp_id))
+        if(subp_id ==num_pieces-1): #when receives a subpiece of the last piece.
+            handling_last +=1
+            if(handling_last == math.ceil(last_p_len/b_len)): #Last block forming last piece
+                handling_last = -1
+    else: #debug reasons, not to be received
+        print("Unknown type received from {}:{}".format(peer.ip,peer.port)) #todo or not todo
+        lock.acquire()
+        pieces_requesting[peer.piece_req] = 0
+        lock.release()
+        msg_type = 69
+        exit()
+
+    return peer, msg_type, subpieces, block_len,handling_last
+
+def peer_thread(peer_ip,peer_port,peer_id,info_hash):
+    '''
+    Thread communicating with a peer.
+    Invokes hanshake function and loops handling messages.
+    '''
+    global flag
+    subpieces = []
+    peer = Peer(peer_ip,peer_port)
+    print("Establishing connection with peer: {}:{}".format(peer.ip,peer.port))
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(9)
+    try:
+        sock.connect((peer.ip, peer.port))
+    except: #Cannot connect to peer. Removing thread
+        return
+    print("Connected with {}:{}".format(peer.ip,peer.port))
+
+    if(send_handshake(sock,peer_id,info_hash) == -1):
+        sock.close()        #handshake failed, stop thread
+        return
+
+    index = 0
+    piece_ok = True #if = False, is currently waiting for completing a piece
+    handling_last = 0 #flag set to 1 if thread is handling last piece
+    for i in range(num_pieces):
+        peer.his_bitfield.append(0)
+
+    while True:
+        #check if all pieces have been already requested and I have not any pending block
+        lock.acquire()
+        all_completed = all(p != 0 for p in pieces_requesting)
+        lock.release()
+
+        if(all_completed and piece_ok): #we are ready for downloading but all completed
+            exit()
+
+        peer, type, subpieces,block_len,handling_last = handle_peer(sock,peer,subpieces,handling_last)
+
+        if((len(subpieces)==piece_len/b_len)or handling_last==-1):
+            #we got all subpieces forming a piece or last piece
+            p_index = subpieces[0][3]
+            valid, piece = check_piece(subpieces,p_index)
+            if(valid): #piece is valid
+                lock2.acquire()
+                progress.append(1)
+                sys.stdout.write("\r%d%% downloaded." % (float(len(progress))/num_pieces *100))
+                if(len(progress)==num_pieces): #TODO remove -1 after last block issue is solved
+                    sys.stdout.write("\n")
+                lock2.release()
+                sys.stdout.flush()
+
+                lock.acquire()
+                pieces_completed[p_index] = (piece,p_index)
+                lock.release()
+                subpieces = [] #cleans subpiece array
+                piece_ok = True
+                if(float(len(progress))/num_pieces *100 == 100):
+                    flag = -1
+                    exit()
+            else: #piece is not valid, request it again
+                lock.acquire()
+                pieces_requesting[p_index] = 0
+                lock.release()
+                subpieces = []
+                piece_ok = True #to request it again
+
+        if(piece_ok): #ready for requesting a piece
+            for p_index,piece in enumerate(peer.his_bitfield):
+                lock.acquire() #acquires lock before accessing shared lists (pieces completed and requesting)
+                if(piece==1 and pieces_completed[p_index][0]==0):
+                    #he has a  piece that we do not. Send interested and request.
+                    if(pieces_requesting[p_index] == 0): #no thread has requested that piece
+                        pieces_requesting[p_index] = 1
+                        peer.piece_req = p_index
+                        lock.release() #done before request_piece to avoid block lock on choking
+                        peer = request_piece(sock, peer, p_index,0,handling_last)
+                        piece_ok = False # we are currently forming a piece
+                        break
+                    else: #that piece has been requested by other thread
+                        lock.release()
+                        continue
+                else: #peer does not have that piece
+                    lock.release()
+                    continue #iterate to the next
+        else: #we are still waiting for receiving all the subpieces
+            continue
+
+    #Should not get to here, safe closing just in case.
+    sock.close()
+
+def check_piece(subpieces, index):
+    '''
+    Given all subpieces forming a piece, crafts the piece and checks its
+    hash with the original from the hash list. Returns true & pieces or false.
+    '''
+    piece = b''
+    for subpiece in subpieces: #joins all subpieces
+        piece += subpiece[0]
+    m = hashlib.sha1()
+    m.update(piece)
+    piece_hash = m.digest()
+    if(piece_hash == hash_list[index]):
+        return True,piece
+    else:
+        return False, 0
+
+
+def create_file(filename, correct_pieces):
+    '''
+    Given the filename of downloaded file, and the array containing
+    all correctly downloaded pieces, generates the final file.
+    '''
+    start_time = time.time()
+    downloaded_file = open(filename,"wb+")
+    compl = b''
+    for piece in correct_pieces:
+        compl += piece
+    downloaded_file.write(compl)
+    downloaded_file.close()
+    elapsed_time = time.time() - start_time
+    print("Done writing file in {}.".format(elapsed_time))
+    return
+
+def handle_compact_peers(bytepeers):
+    '''
+    Given a stream of bytes corresponding to a compacted peer list,
+    extract dictionary of peer:port corresponding to the tracker.
+    '''
+    bytelist = [bytepeers[i:i+6] for i in range(0, len(bytepeers), 6)]
+    peer_list = []
+    for byt in bytelist:
+        peer_list.append((socket.inet_ntoa(byt[:4]),int.from_bytes(byt[4:6],"big")))
+    peer_dictlist = []
+    for peer in peer_list:
+        peer_dictlist.append({'ip':peer[0],'port':peer[1]})
+
+    return peer_dictlist
+
+def torrent_tracker_comms(torrent_filename):
+    '''
+    Obtains metainfo from torrent file and handles initial Tracker comms.
+    Returns info about pieces (num, length and hashlist),file and peer info.
+    It also returns the info_hash of the file.
+    '''
+    with open(torrent_filename, 'rb') as f:
+        torrent = bdecode(f)
+    req_str = torrent['announce']
+    if("files" in list(torrent['info'].keys())):
+        filename = torrent['info']['files'][0]['path'][0]
+        file_len = torrent['info']['files'][0]['length']
+    elif("name" in list(torrent['info'].keys())):
+        filename = torrent['info']['name']
+        file_len =  torrent['info']['length']
+
+    print(req_str)
+    pieces = torrent['info']['pieces'] #sha1-string of every piece hashed, concatenated.
+    piece_len = torrent['info']['piece length']
+    num_pieces = math.ceil(file_len / piece_len)
+    print("File length:{} Mb, Piece length: {} bytes, Number of pieces:{}.".format(file_len/1000000,piece_len,num_pieces))
+    if('https' in req_str):
+        host_name = req_str[8:].split("/")
+    else:
+        host_name = req_str[7:].split("/")
+
+    host_ip = socket.gethostbyname(host_name[0].split(":")[0])
+
+    info = bencode(torrent['info'])
+    m = hashlib.sha1()
+    m.update(info)
+    info_hash = m.digest()
+    url_info_hash= urllib.parse.quote_plus(info_hash) #url encoding of request
+
+    peer_id = "12345".encode('utf-8') #TODO proper random peerid encoding
+    m = hashlib.sha1()
+    m.update(peer_id)
+    peer_id = m.digest()
+    url_peer_id = urllib.parse.quote_plus(peer_id)
+
+    req_str += "?info_hash="+url_info_hash +"&peer_id="+url_peer_id+"&port=6881"+"&compact=1"#+"&event=started"
+
+    get_req = urllib.request.Request(req_str)
+    f = urllib.request.urlopen(get_req)
+    data = f.read()
+    f.close()
+
+    bdec_data = bdecode(data)
+    peers = bdec_data['peers']
+    #checks peer data: if not compact, already has dictionary
+    if type(peers) is not type([]):
+        peers = handle_compact_peers(peers)
+
+    return filename, piece_len, num_pieces, file_len, pieces, peers, peer_id, info_hash
+
+def main():
+    global handling_last, flag #flag indicating last piece handling
+    flag = 0
+    handling_last = 0
+    #Thread synchronization
+    global lock, lock2, progress
+    progress = []
+    lock2 = threading.Lock()
+    lock = threading.Lock()
+    global piece_len, file_len, num_pieces, last_p_len, b_len
+    global pieces_requesting, pieces_completed
+    pieces_requesting = [] #each time we resquest we add it here the piece id
+    pieces_completed = [] #Has pieces id completed. E.g: [0,0,0,1,0]=got piece i=3
+    torrent_filename = sys.argv[1]
+    b_len = 0
+
+    #Start tracker comms.
+    filename, piece_len, num_pieces, file_len, pieces_hash, peers , peer_id, info_hash = torrent_tracker_comms(torrent_filename)
+    last_p_len = file_len - (piece_len*(num_pieces-1))
+    print("Last piece length: {}".format(last_p_len))
+    b_len = 16384 #fixed 4000 in hex
+    global hash_list
+    hash_list = [pieces_hash[i:i+20] for i in range(0, len(pieces_hash), 20)]
+
+    #initialize our empty bitfield and requesting
+    for index in range(num_pieces):
+        pieces_completed.append((0,0))
+        pieces_requesting.append(0)
+
+    thread_list = []
+    #shuffle(peers)
+    for peer in peers:
+        if(len(thread_list) >10):
+            break #limit of connection to peers
+        peer_ip = peer['ip']
+        peer_port = peer['port']
+        p_thread = threading.Thread(target=peer_thread, args=(peer_ip,peer_port,peer_id,info_hash,))
+        p_thread.daemon = True #so that closes when disc
+        thread_list.append(p_thread)
+        p_thread.start()
+
+    start_time = time.time()
+
+    while(flag != -1):
+        time.sleep(0.5)
+
+    #[thread.join() for thread in thread_list]
+    elapsed_time = time.time() - start_time
+    print("Done downloading all pieces of file in {}.".format(elapsed_time))
+
+    finished_pieces = [piece[0] for piece in pieces_completed if piece[0]!=0]
+
+    print("Downloaded succesfully {} of {} pieces".format(len(finished_pieces),num_pieces))
+    create_file(filename, finished_pieces)
+
+    exit()
+
+main()
